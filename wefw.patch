@@ -1,0 +1,160 @@
+--- a/faceit_registration_bot.py
++++ b/faceit_registration_bot.py
+@@ -1612,6 +1612,65 @@
+ 
+ # --- ⬆️ КОНЕЦ НОВОГО БЛОКА ⬆️ ---
+ 
++async def handle_all_confirmed(lobby_id: int, bot: Bot):
++    """
++    (НОВАЯ ФУНКЦИЯ)
++    Вызывается, когда 10/10 игроков подтвердили участие.
++    """
++    logger.info(f"[Lobby {lobby_id}] 10/10 подтвердили! Запуск матча...")
++    
++    # 1. Устанавливаем статус, чтобы таймер (start_confirmation_timer) 
++    #    понял, что он больше не нужен
++    db_execute("UPDATE lobbies SET status = 'starting' WHERE lobby_id = ?", (lobby_id,))
++    
++    # 2. Оповещаем всех
++    await broadcast_final_message(
++        lobby_id, 
++        bot, 
++        "<b>✅ Все игроки подтвердили участие!</b>\n\n"
++        "🚀 Матч начинается. Переходим к выбору капитанов и бану карт..."
++    )
++    
++    # 3. Пауза, чтобы игроки увидели сообщение
++    await asyncio.sleep(3) 
++    
++    # 4. Начинаем выбор капитанов
++    await start_captain_selection(lobby_id, bot)
++
++async def start_confirmation_phase(lobby_id: int, bot: Bot):
++    """
++    (НОВАЯ ФУНКЦИЯ)
++    Начинает фазу 'ready check', сбрасывает таймер и auto-confirms ботов.
++    """
++    logger.info(f"[Lobby {lobby_id}] Начало 'Ready Check'...")
++    
++    # 1. Устанавливаем статус и сбрасываем подтверждения
++    db_execute("UPDATE lobbies SET status = 'confirming' WHERE lobby_id = ?", (lobby_id,))
++    db_execute("UPDATE lobby_members SET confirmed = 0 WHERE lobby_id = ?", (lobby_id,))
++    
++    # 2. АВТО-ПОДТВЕРЖДЕНИЕ БОТОВ
++    # Боты (user_id < 0) всегда ' готовы'
++    db_execute("UPDATE lobby_members SET confirmed = 1 WHERE lobby_id = ? AND user_id < 0", (lobby_id,))
++    logger.info(f"[Lobby {lobby_id}] Боты автоматически подтверждены.")
++
++    # 3. Проверяем, не заполнено ли уже 10/10 (например, 10 ботов)
++    confirmed_count = db_fetchone(
++        "SELECT COUNT(*) as count FROM lobby_members WHERE lobby_id = ? AND confirmed = 1",
++        (lobby_id,)
++    )
++    
++    if confirmed_count and confirmed_count['count'] == 10:
++        logger.info(f"[Lobby {lobby_id}] Все 10/10 подтверждены немедленно (вероятно, боты).")
++        # Не запускаем таймер, сразу идем к банам
++        await handle_all_confirmed(lobby_id, bot)
++        return
++
++    # 4. Есть люди, которые должны нажать 'ready'.
++    # Отправляем им UI и запускаем таймер.
++    await broadcast_ready_check_update(lobby_id, bot)
++    asyncio.create_task(start_confirmation_timer(lobby_id, bot))
++
++
+ async def start_captain_selection(lobby_id: int, bot: Bot):
+     """Выбирает двух капитанов и начинает фазу банов карт."""
+     
+@@ -2085,21 +2144,11 @@
+     updated_lobby = db_fetchone("SELECT current_players FROM lobbies WHERE lobby_id = ?", (lobby_id,))
+     
+     if updated_lobby['current_players'] == 10:
+-        bot_check = db_fetchone(
+-            "SELECT 1 FROM lobby_members WHERE lobby_id = ? AND user_id < -10000 LIMIT 1",
+-            (lobby_id,)
+-        )
+-        
+-        if bot_check:
+-            logger.info(f"Лобби {lobby_id} (с ботами) заполнено")
+-            db_execute("UPDATE lobby_members SET confirmed = 1 WHERE lobby_id = ?", (lobby_id,))
+-            await start_captain_selection(lobby_id, bot)
+-        else:
+-            logger.info(f"Лобби {lobby_id} заполнено, старт подтверждения")
+-            await start_confirmation_phase(lobby_id, bot)
++        # --- ❗️ НАЧАЛО ИСПРАВЛЕНИЯ (ПРОБЛЕМА 1) ❗️ ---
++        logger.info(f"Лобби {lobby_id} заполнено (10/10). Запуск 'Ready Check'.")
++        # Мы ВСЕГДА запускаем 'start_confirmation_phase'.
++        # Эта функция сама разберется с ботами (auto-confirm).
++        await start_confirmation_phase(lobby_id, bot)
++        # --- ❗️ КОНЕЦ ИСПРАВЛЕНИЯ (ПРОБЛЕМА 1) ❗️ ---
+     
+     await callback.answer("✅ Вы присоединились к лобби!")
+     
+@@ -2125,6 +2174,67 @@
+         # Предупреждение будет записано в лог, но бот не упадет
+         logger.warning(f"Ошибка ответа на callback (exit blocked): {e}")
+ 
++@dp.callback_query(F.data.startswith("confirm_participation_"))
++async def confirm_participation_handler(callback: types.CallbackQuery):
++    """
++    (НОВЫЙ ОБРАБОТЧИК)
++    Обрабатывает нажатие "✅ Подтвердить участие"
++    """
++    try:
++        lobby_id = int(callback.data.split("_")[-1])
++    except:
++        await callback.answer("❌ Ошибка: ID лобби не найден.", show_alert=True)
++        return
++
++    user_id = callback.from_user.id
++    
++    # 1. Проверяем статус лобби
++    lobby = db_fetchone("SELECT status FROM lobbies WHERE lobby_id = ?", (lobby_id,))
++    if not lobby or lobby['status'] != 'confirming':
++        await callback.answer("❌ Подтверждение уже не требуется или отменено.", show_alert=True)
++        try:
++            # Убираем клавиатуру у этого пользователя
++            await callback.message.edit_reply_markup(reply_markup=None)
++        except:
++            pass
++        return
++
++    # 2. Проверяем, состоит ли юзер в этом лобби
++    member = db_fetchone(
++        "SELECT confirmed FROM lobby_members WHERE lobby_id = ? AND user_id = ?",
++        (lobby_id, user_id)
++    )
++    if not member:
++        await callback.answer("❌ Вы не состоите в этом лобби.", show_alert=True)
++        return
++        
++    # 3. Проверяем, не нажал ли он уже
++    if member['confirmed'] == 1:
++        await callback.answer("✅ Вы уже подтвердили участие.", show_alert=True)
++        return
++        
++    # 4. Подтверждаем!
++    db_execute("UPDATE lobby_members SET confirmed = 1 WHERE lobby_id = ? AND user_id = ?", (lobby_id, user_id))
++    await callback.answer("✅ Вы подтвердили участие!", show_alert=False)
++    
++    # 5. Обновляем UI у всех
++    await broadcast_ready_check_update(lobby_id, bot)
++    
++    # 6. Проверяем, не был ли это 10-й
++    confirmed_count = db_fetchone(
++        "SELECT COUNT(*) as count FROM lobby_members WHERE lobby_id = ? AND confirmed = 1",
++        (lobby_id,)
++    )
++    
++    if confirmed_count and confirmed_count['count'] == 10:
++        # 10/10!
++        # Запускаем финальную стадию
++        await handle_all_confirmed(lobby_id, bot)
++
++
++
++
++
+     logger.warning(f"Пользователь {user_id} пытался покинуть лобби {lobby_id} во время статуса '{current_status}'")
+     return
